@@ -26,6 +26,18 @@ export default function APIPageClient({ machineId }) {
   const [hasPassword, setHasPassword] = useState(true);
   const [tunnelDashboardAccess, setTunnelDashboardAccess] = useState(false);
   const [rtkEnabled, setRtkEnabledState] = useState(false);
+  const [tc, setTc] = useState({
+    enabled: false,
+    losslessOnly: false,
+    threshold: 0.75,
+    thresholdAbsolute: 8000,
+    keepLastTurns: 6,
+    summarizer: { mode: "extractive", connectionId: null, model: null },
+    protectCodeBlocks: true,
+    applyToResponseJson: false,
+    observability: true,
+  });
+  const [tcSaving, setTcSaving] = useState(false);
 
   // Cloudflare Tunnel state
   const [tunnelChecking, setTunnelChecking] = useState(true);
@@ -82,6 +94,16 @@ export default function APIPageClient({ machineId }) {
         setHasPassword(data.hasPassword || false);
         setTunnelDashboardAccess(data.tunnelDashboardAccess || false);
         setRtkEnabledState(data.rtkEnabled || false);
+        if (data.tokenCompression && typeof data.tokenCompression === "object") {
+          setTc((prev) => ({
+            ...prev,
+            ...data.tokenCompression,
+            summarizer: {
+              ...prev.summarizer,
+              ...(data.tokenCompression.summarizer || {}),
+            },
+          }));
+        }
       }
       if (statusRes.ok) {
         const data = await statusRes.json();
@@ -166,6 +188,35 @@ export default function APIPageClient({ machineId }) {
       if (res.ok) setRequireApiKey(value);
     } catch (error) {
       console.log("Error updating requireApiKey:", error);
+    }
+  };
+
+  const updateTc = async (patch) => {
+    // Merge locally first for snappy UI; ship the full block to keep nested keys safe.
+    const merged = {
+      ...tc,
+      ...patch,
+      summarizer: {
+        ...tc.summarizer,
+        ...(patch.summarizer || {}),
+      },
+    };
+    setTc(merged);
+    setTcSaving(true);
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tokenCompression: merged }),
+      });
+      if (!res.ok) {
+        // revert on failure
+        setTc(tc);
+      }
+    } catch {
+      setTc(tc);
+    } finally {
+      setTcSaving(false);
     }
   };
 
@@ -591,6 +642,36 @@ export default function APIPageClient({ machineId }) {
     }
   };
 
+  // Cycle the per-key Token Compression override:
+  //   inherit (null) → on ({enabled:true}) → off ({enabled:false}) → inherit
+  const cycleKeyTcOverride = async (key) => {
+    const current = key.tokenCompression;
+    let nextOverride;
+    if (current == null) nextOverride = { enabled: true };
+    else if (current.enabled === true) nextOverride = { enabled: false };
+    else nextOverride = null;
+
+    try {
+      const res = await fetch(`/api/keys/${key.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tokenCompression: nextOverride }),
+      });
+      if (res.ok) {
+        setKeys(prev => prev.map(k => k.id === key.id ? { ...k, tokenCompression: nextOverride } : k));
+      }
+    } catch (error) {
+      console.log("Error updating key TC override:", error);
+    }
+  };
+
+  const labelKeyTc = (key) => {
+    const o = key.tokenCompression;
+    if (o == null) return { text: "TC: inherit", cls: "bg-sidebar text-text-muted" };
+    if (o.enabled === true) return { text: "TC: on", cls: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" };
+    return { text: "TC: off", cls: "bg-zinc-500/15 text-zinc-500 dark:text-zinc-400" };
+  };
+
   const maskKey = (fullKey) => {
     if (!fullKey) return "";
     return fullKey.length > 8 ? fullKey.slice(0, 8) + "..." : fullKey;
@@ -849,6 +930,134 @@ export default function APIPageClient({ machineId }) {
         </div>
       </Card>
 
+      {/* Token Compression (TC) */}
+      <Card id="token-compression">
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            <h2 className="text-lg font-semibold">Token Compression</h2>
+            <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30">
+              Experimental
+            </span>
+            {tcSaving && (
+              <span className="text-xs text-text-muted flex items-center gap-1">
+                <span className="material-symbols-outlined animate-spin text-[14px]">progress_activity</span>
+                Saving...
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Master toggle */}
+        <div className="flex items-center justify-between pt-2 pb-4 border-b border-border">
+          <div className="pr-4">
+            <p className="font-medium">Enable token compression</p>
+            <p className="text-sm text-text-muted">
+              Hybrid pipeline: lossless normalize → tokenizer-aware threshold → history compaction.
+              Runs before provider call. Skips <code>tool_result</code> (handled by RTK).
+              Look for <code>[TC] saved ...</code> in server console.
+            </p>
+          </div>
+          <Toggle checked={tc.enabled} onChange={() => updateTc({ enabled: !tc.enabled })} />
+        </div>
+
+        {/* Sub-options (only meaningful when enabled) */}
+        <div className={`flex flex-col gap-4 pt-4 ${tc.enabled ? "" : "opacity-60 pointer-events-none"}`}>
+          <div className="flex items-center justify-between">
+            <div className="pr-4">
+              <p className="font-medium text-sm">Lossless only</p>
+              <p className="text-xs text-text-muted">Skip history compaction; only whitespace/dedup. Safest, smallest savings.</p>
+            </div>
+            <Toggle size="sm" checked={tc.losslessOnly} onChange={() => updateTc({ losslessOnly: !tc.losslessOnly })} />
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div className="pr-4">
+              <p className="font-medium text-sm">Protect code blocks</p>
+              <p className="text-xs text-text-muted">Never modify content inside fenced code blocks (``` or ~~~).</p>
+            </div>
+            <Toggle size="sm" checked={tc.protectCodeBlocks} onChange={() => updateTc({ protectCodeBlocks: !tc.protectCodeBlocks })} />
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div className="pr-4">
+              <p className="font-medium text-sm">Observability log</p>
+              <p className="text-xs text-text-muted">Print <code>[TC]</code> savings line per request to server console.</p>
+            </div>
+            <Toggle size="sm" checked={tc.observability} onChange={() => updateTc({ observability: !tc.observability })} />
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4 border-t border-border">
+            <div>
+              <label className="text-sm font-medium block mb-1">Threshold ratio</label>
+              <p className="text-xs text-text-muted mb-2">
+                Compact history when estimated tokens exceed <strong>{Math.round(tc.threshold * 100)}%</strong> of model context.
+              </p>
+              <input
+                type="range"
+                min="0.5"
+                max="0.95"
+                step="0.05"
+                value={tc.threshold}
+                onChange={(e) => updateTc({ threshold: Number(e.target.value) })}
+                className="w-full"
+              />
+              <div className="flex justify-between text-xs text-text-muted mt-1">
+                <span>50%</span>
+                <span>95%</span>
+              </div>
+            </div>
+
+            <div>
+              <label className="text-sm font-medium block mb-1">Absolute fallback (tokens)</label>
+              <p className="text-xs text-text-muted mb-2">Used when model context is unknown.</p>
+              <Input
+                type="number"
+                min={1024}
+                step={512}
+                value={tc.thresholdAbsolute}
+                onChange={(e) => updateTc({ thresholdAbsolute: Math.max(1024, Number(e.target.value) || 8000) })}
+                className="font-mono text-sm"
+              />
+            </div>
+
+            <div>
+              <label className="text-sm font-medium block mb-1">Keep last N turns</label>
+              <p className="text-xs text-text-muted mb-2">Recent turns kept verbatim. Older ones get compacted.</p>
+              <Input
+                type="number"
+                min={1}
+                max={50}
+                value={tc.keepLastTurns}
+                onChange={(e) => updateTc({ keepLastTurns: Math.max(1, Number(e.target.value) || 6) })}
+                className="font-mono text-sm"
+              />
+            </div>
+
+            <div>
+              <label className="text-sm font-medium block mb-1">Summarizer mode</label>
+              <p className="text-xs text-text-muted mb-2">How older turns get compacted.</p>
+              <select
+                value={tc.summarizer?.mode || "extractive"}
+                onChange={(e) => updateTc({ summarizer: { mode: e.target.value } })}
+                className="w-full px-3 py-1.5 rounded border border-border bg-input text-sm"
+              >
+                <option value="extractive">Extractive (rule-based, no extra cost)</option>
+                <option value="off">Off (drop older turns header only)</option>
+                <option value="llm" disabled>LLM (coming soon)</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between pt-4 border-t border-border">
+            <div className="pr-4">
+              <p className="font-medium text-sm">Compress non-stream JSON response</p>
+              <p className="text-xs text-text-muted">Apply lossless to the final JSON response (only when client did not request streaming). Off by default.</p>
+            </div>
+            <Toggle size="sm" checked={tc.applyToResponseJson} onChange={() => updateTc({ applyToResponseJson: !tc.applyToResponseJson })} />
+          </div>
+        </div>
+      </Card>
+
       {/* API Keys */}
       <Card id="require-api-key">
         <div className="flex items-center justify-between mb-4">
@@ -921,6 +1130,19 @@ export default function APIPageClient({ machineId }) {
                   )}
                 </div>
                 <div className="flex items-center gap-2">
+                  {(() => {
+                    const lbl = labelKeyTc(key);
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => cycleKeyTcOverride(key)}
+                        title="Token Compression override (inherit → on → off)"
+                        className={`text-[11px] font-mono px-1.5 py-0.5 rounded border border-transparent hover:border-border transition-colors ${lbl.cls}`}
+                      >
+                        {lbl.text}
+                      </button>
+                    );
+                  })()}
                   <Toggle
                     size="sm"
                     checked={key.isActive ?? true}

@@ -8,7 +8,11 @@ import {
   isValidApiKey,
 } from "../services/auth.js";
 import { cacheClaudeHeaders } from "open-sse/utils/claudeHeaderCache.js";
-import { getSettings } from "@/lib/localDb";
+import { getSettings, getApiKeyByKey } from "@/lib/localDb";
+import {
+  compressRequestBody,
+  resolveEffectiveTcSettings,
+} from "@/lib/tokenCompression/index.js";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
@@ -82,6 +86,30 @@ export async function handleChat(request, clientRawRequest = null) {
   if (!modelStr) {
     log.warn("CHAT", "Missing model");
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
+  }
+
+  // ── Token Compression (TC) ──
+  // Hybrid pipeline: lossless → tokenizer-aware threshold → history compaction.
+  // Runs once per request, before bypass/combo. Uses effective settings merged
+  // from global + per-API-key override. RTK still runs downstream untouched.
+  try {
+    const apiKeyRecord = apiKey ? await getApiKeyByKey(apiKey) : null;
+    const tcSettings = resolveEffectiveTcSettings(
+      settings.tokenCompression,
+      apiKeyRecord && apiKeyRecord.tokenCompression ? apiKeyRecord.tokenCompression : null,
+    );
+    if (tcSettings.enabled) {
+      const { body: compressedBody, stats } = compressRequestBody(body, {
+        settings: tcSettings,
+        modelName: modelStr,
+      });
+      if (stats) {
+        body = compressedBody;
+        if (tcSettings.observability && stats.log) console.log(stats.log);
+      }
+    }
+  } catch (tcErr) {
+    log.warn("TC", `compression skipped: ${tcErr?.message || tcErr}`);
   }
 
   // Bypass naming/warmup requests before combo rotation to avoid wasting rotation slots

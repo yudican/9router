@@ -37,6 +37,21 @@ const DEFAULT_SETTINGS = {
   outboundNoProxy: "",
   mitmRouterBaseUrl: DEFAULT_MITM_ROUTER_BASE,
   rtkEnabled: false,
+  tokenCompression: {
+    enabled: false,
+    losslessOnly: false,
+    threshold: 0.75,
+    thresholdAbsolute: 8000,
+    keepLastTurns: 6,
+    summarizer: {
+      mode: "extractive",
+      connectionId: null,
+      model: null,
+    },
+    protectCodeBlocks: true,
+    applyToResponseJson: false,
+    observability: true,
+  },
 };
 
 function cloneDefaultData() {
@@ -90,6 +105,35 @@ function ensureDbShape(data) {
             next.settings[settingKey] = settingDefault;
           }
           changed = true;
+        } else if (
+          settingDefault &&
+          typeof settingDefault === "object" &&
+          !Array.isArray(settingDefault) &&
+          next.settings[settingKey] &&
+          typeof next.settings[settingKey] === "object" &&
+          !Array.isArray(next.settings[settingKey])
+        ) {
+          // Deep-merge defaults for nested setting objects (e.g. tokenCompression)
+          for (const [nKey, nDefault] of Object.entries(settingDefault)) {
+            if (next.settings[settingKey][nKey] === undefined) {
+              next.settings[settingKey][nKey] = nDefault;
+              changed = true;
+            } else if (
+              nDefault &&
+              typeof nDefault === "object" &&
+              !Array.isArray(nDefault) &&
+              next.settings[settingKey][nKey] &&
+              typeof next.settings[settingKey][nKey] === "object" &&
+              !Array.isArray(next.settings[settingKey][nKey])
+            ) {
+              for (const [n2Key, n2Default] of Object.entries(nDefault)) {
+                if (next.settings[settingKey][nKey][n2Key] === undefined) {
+                  next.settings[settingKey][nKey][n2Key] = n2Default;
+                  changed = true;
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -685,6 +729,12 @@ export async function validateApiKey(key) {
   const db = await getDb();
   const found = db.data.apiKeys.find(k => k.key === key);
   return found && found.isActive !== false;
+}
+
+export async function getApiKeyByKey(key) {
+  if (!key) return null;
+  const db = await getDb();
+  return db.data.apiKeys.find(k => k.key === key) || null;
 }
 
 export async function cleanupProviderConnections() {
